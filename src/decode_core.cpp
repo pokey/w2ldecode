@@ -174,6 +174,7 @@ struct SimpleDecoderState {
 };
 #pragma pack(pop)
 
+// RNTZ: this seems to be where new candidates are created
 template <typename LMStateType1, typename LMStateType2>
 static void beamSearchNewCandidate(
         std::vector<SimpleDecoderState<LMStateType2>> &candidates,
@@ -327,6 +328,7 @@ struct BeamSearch
                Hooks &hooks = DefaultHooks<DecoderState>::instance) const;
 };
 
+// RNTZ: this seems like the place to start looking
 template <typename LM, typename LMStateType>
 template <typename Range, typename Hooks>
 auto BeamSearch<LM, LMStateType>::run(
@@ -354,6 +356,9 @@ auto BeamSearch<LM, LMStateType>::run(
     for (int t = 0; t < frames; t++) {
         // std::cout << "\nframe: " << t << "\n";
         int frame = startFrame + t;
+        // RNTZ: Apparently opt_.beamSizeToken limits the number of tokens
+        // considered in each step? We prune indexSet to be a set of the
+        // highest-ranked tokens by emissions matrix.
         if (nTokens_ > opt_.beamSizeToken) {
             std::iota(indices.begin(), indices.end(), 0);
             std::partial_sort(
@@ -368,6 +373,8 @@ auto BeamSearch<LM, LMStateType>::run(
         }
         candidates.clear();
 
+        // RNTZ: Finds the most likely token by emissions & its score.
+        // Seems like dead code?
         float maxEmissionScore = -INFINITY;
         int maxEmissionToken = -1;
         for (int i = 0; i < nTokens_; ++i) {
@@ -408,10 +415,13 @@ auto BeamSearch<LM, LMStateType>::run(
             repeatPrevLex &= prevLmState.forChildren(t, indexSet, lm_, [&, prevIdx, prevMaxScore](auto lmState, int n, bool hasChildren) {
                 if (n == prevIdx && (opt_.criterionType != CriterionType::CTC || !prevHyp.getPrevBlank()))
                     repeatPrevLex = true;
+                // RNTZ: add the score of the emitted token
                 float score = prevHyp.score + emissions[frame * nTokens_ + n];
+                // RNTZ: what's going on here? What is transitions_?
                 if (frame > 0 && transitions_.size() > 0) {
                     score += transitions_[n * nTokens_ + prevIdx];
                 }
+                // if the emission is silence or blank, we add silence score
                 if (n == sil_ || n == blank_) {
                     score += opt_.silScore;
                 }
@@ -421,6 +431,9 @@ auto BeamSearch<LM, LMStateType>::run(
                 bool hadLabel = false;
                 lmState.forLabels(lm_, [&, prevMaxScore, score](LMStateType labelLmState, int label, float lmScore) {
                     hadLabel = true;
+                    // RNTZ: lScore is the score of the new candidate? so the score is:
+                    //    emissions + lm score * opt_.lmWeight + opt_.wordScore
+                    // IF we've finished a word???
                     float lScore = score + opt_.lmWeight * (lmScore - prevMaxScore) + opt_.wordScore;
                     beamSearchNewCandidate(
                             candidates,
