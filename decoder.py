@@ -42,6 +42,7 @@ class TryNode:
             child.smear_score()
             self.score = max(self.score, child.score)
 
+# TODO: replace this with a function called build_trie() -> TryNode
 class Trie:
     root: TryNode
 
@@ -73,18 +74,30 @@ class Trie:
         node.words.append((word, score))
 
 @dataclass
+class State:
+    node: TryNode
+    def score(self): return self.node.score
+    def suggestions(self):
+        return self.node.children.keys()
+    def transition(self, token: str) -> 'State':
+        return State(self.node.children[token])
+
+@dataclass
 class Tokens:
     token: str
     parent: Optional['Token']
 
 @dataclass
 class Beam:
+    # tokens absorbed so far, linked list in reverse order
     tokens: Tokens
-    state: Any
+    # state used to guide the search
+    state: State
+    # sum of token scores from emissions matrix
     emission_score: float
 
     def score(self):
-        # probably need a balancing factor here
+        # probably need a weighting factor here
         return self.emission_score + self.state.score()
 
     def text(self):
@@ -95,23 +108,23 @@ class Beam:
             node = node.parent
         return ''.join(reversed(out))
 
-    def __str__(self):
-        return f"Beam {{{self.score()}, {self.text()}}}"
+    # for debugging
+    def __str__(self): return f"Beam {self.score()} {self.text()}"
 
 class Decoder:
     tokens:    str
     criterion: str
-    trie:      Trie
+    root:      State
 
     beamsize: int
     beamthreshold: float
 
-    def __init__(self, tokens: str, *, criterion: str, trie: Trie, beamsize: int=1, beamthreshold: float=math.inf):
+    def __init__(self, tokens: str, *, criterion: str, root: State, beamsize: int=1, beamthreshold: float=math.inf):
         if criterion == 'ctc' and not '#' in tokens:
             tokens += '#'
         self.tokens    = tokens
         self.criterion = criterion
-        self.trie      = trie
+        self.root      = root
         self.beamsize  = beamsize
         self.beamthreshold = beamthreshold
 
@@ -149,14 +162,14 @@ class Decoder:
 
     def decode(self, x: np.array) -> list[Beam]:
         # performs beam search
-        root = Beam(tokens=Tokens('|', None), emission_score=0, try_node=self.trie.root)
+        root = Beam(state=self.root, tokens=Tokens('|', None), emission_score=0)
         beams: list[Beam] = [root]
         for t, step in enumerate(x):
             new_beams: list[Beam] = []
             for parent in beams:
                 prev_token = parent.tokens.token
                 # possible next tokens
-                suggestions = {prev_token} | parent.try_node.children.keys()
+                suggestions = {prev_token} | parent.state.suggestions()
                 if self.criterion == 'ctc': suggestions.add('#')
                 for n, token in enumerate(self.tokens):
                     if token not in suggestions: continue
@@ -165,10 +178,10 @@ class Decoder:
                         tokens = Tokens(token, parent.tokens),
                         emission_score = score + parent.emission_score,
                         # if token is nonblank & distinct from previous token,
-                        # we transition the try node.
-                        try_node = parent.try_node
-                                   if token == prev_token or token == '#'
-                                   else parent.try_node.children[token]
+                        # we transition the model state.
+                        state = parent.state
+                                if token == prev_token or token == '#'
+                                else parent.state.transition(token)
                     ))
             if not new_beams:
                 print("STUCK:")
@@ -198,7 +211,8 @@ def main():
     tokens = "|'abcdefghijklmnopqrstuvwxyz"
     trie = Trie(model_path=os.path.join(CONFORMER_PATH, "lm-ngram.bin"),
                 lexicon_path=os.path.join(CONFORMER_PATH, "lexicon.txt"))
-    decoder = Decoder(tokens, criterion='ctc', beamsize=20, trie=trie)
+    root = State(node = trie.root)
+    decoder = Decoder(tokens, criterion='ctc', beamsize=20, root=root)
     decoder.synthetic_test('a')
     decoder.synthetic_test('hello')
     # these don't decode properly yet, only handle single words so far
