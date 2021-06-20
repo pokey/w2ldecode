@@ -1,10 +1,20 @@
 from dataclasses import dataclass
-from typing import Optional, Any
+from typing import Optional, Any, Iterator
 import math
 import random
 import numpy as np
 import kenlm
 import os
+
+# TODOs
+# 1. use ints for tokens instead of strs
+#
+# 2. fix the scoring. refer to the c++ code.
+#    should make a comment explaining the scoring once I grok it.
+# 2a. scoring of finishing a word is wrong.
+# 2b. mixing scores from model/emissions needs a weighting factor
+#
+# 3. factor out the LM stuff, like in aegis' example, instead of inlining kenlm code everywhere
 
 CONFORMER_PATH = os.path.expanduser("~/.talon/w2l/en_US-conformer")
 # specific to double precision
@@ -24,11 +34,59 @@ def log_add(loga, logb):
     if minusdif < MINUS_LOG_THRESHOLD: return loga
     return loga + np.log1p(math.exp(minusdif))
 
+# Guide is an interfaces. TODO: how do those work in mypy?
+class Guide:
+    def children(self, beam: 'Beam', decoder: 'Decoder') -> Iterator['Beam']:
+        raise NotImplementedError
+
+GuideStack = Optional[tuple[Guide, 'GuideStack']]
+
+@dataclass
+class Beam:
+    # previous/parent beam state
+    parent: Optional['Beam']
+    token: str
+    score: float
+    # LM state, preserved across multiple invocations of LM
+    lm_state: kenlm.State
+    # state used to guide the search
+    guide: Guide
+    guides: GuideStack
+
+    def child(self, token, score_delta = 0) -> 'Beam':
+        # the point of putting score_delta here is that scores coming from
+        # emissions and scores coming from model/graph/dfa should be weighted
+        # differently eventually and this was the only place I could find to
+        # centralize contributions from the model/graph/dfa. kinda ugly :/
+        return Beam(parent = self, token = token, score = self.score + score_delta,
+                    lm_state = self.lm_state, guide=self.guide, guides=self.guides)
+
+    def text(self):
+        node = self
+        out: list[str] = []
+        while node is not None:
+            out.append(node.token)
+            node = node.parent
+        return ''.join(reversed(out))
+
+    # for debugging
+    def __str__(self):
+        guides = [self.guide]
+        stack = self.guides
+        while stack:
+            guide, stack = stack
+            guides.append(guide)
+        return f"Beam {' '.join([str(x) for x in guides])} {self.score:.3f} {self.text()}"
+
+# implements Guide
 @dataclass
 class TryNode:
     score: float
     words: list[tuple[str, float]]
-    children: dict[str, 'TryNode']
+    edges: dict[str, 'TryNode']
+
+    def __str__(self):
+        return f"(TryNode {self.score:.3f} {self.words} {''.join(self.edges.keys())})"
 
     def smear_score(self):
         # It is strange to mix log-add and max this way. It's what the original
@@ -38,93 +96,63 @@ class TryNode:
         self.score = -math.inf
         for _, score in self.words:
             self.score = log_add(self.score, score)
-        for child in self.children.values():
+        for child in self.edges.values():
             child.smear_score()
             self.score = max(self.score, child.score)
 
-# TODO: replace this with a function called build_trie() -> TryNode
-class Trie:
-    root: TryNode
-
-    def __init__(self, *, model_path, lexicon_path):
-        self.root = TryNode(score=0, words=[], children={})
-        model = kenlm.Model(model_path)
-        words = []
-        print("loading trie")
-        with open(lexicon_path, 'r') as f:
-            for i, line in enumerate(f):
-                word, *tokens = line.split()
-                if (i+1) % 5000 == 0: print(f" {word}...", end='', flush=True)
-                self.insert(word, tokens, model.score(word))
-        print("\ncalculating scores...")
-        self.root.smear_score()
-        # just to get an idea of what some trie nodes look like
-        for word in ["lexicons", "airport"]:
-            node = self.root
-            for char in word:
-                node = node.children[char]
-            print(node)
-
-    def insert(self, word, tokens, score):
-        node = self.root
-        for t in tokens:
-            if t not in node.children:
-                node.children[t] = TryNode(score=0, words=[], children={})
-            node = node.children[t]
-        node.words.append((word, score))
+    def children(self, beam: Beam, decoder: 'Decoder') -> Iterator[Beam]:
+        for token, node in self.edges.items():
+            if node.edges:      # avoid dead-ending
+                b = beam.child(token, node.score - self.score)
+                b.guide = node
+                yield b
+            for word, _ in node.words:
+                assert token == '|'
+                new_lm_state = kenlm.State()
+                score = decoder.model.BaseScore(beam.lm_state, word, new_lm_state)
+                # TODO: probably want to add opt_.word_score here/somewhere?
+                # TODO: why is this score rather than score - node.score?
+                # seems to give better results on the fake emissions, but probably not quite right.
+                # need to go reread the c++ code.
+                # seems like the c++ actually uses the previous lm state's score to calculate this?
+                b = beam.child(token, score)
+                # print(f"found word: {word}, delta {score - self.score:.3f}, score {b.score}")
+                b.guide, b.guides = beam.guides
+                b.lm_state = new_lm_state
+                yield b
 
 @dataclass
-class State:
-    node: TryNode
-    def score(self): return self.node.score
-    def suggestions(self):
-        return self.node.children.keys()
-    def transition(self, token: str) -> 'State':
-        return State(self.node.children[token])
-
-@dataclass
-class Tokens:
-    token: str
-    parent: Optional['Token']
-
-@dataclass
-class Beam:
-    # tokens absorbed so far, linked list in reverse order
-    tokens: Tokens
-    # state used to guide the search
-    state: State
-    # sum of token scores from emissions matrix
-    emission_score: float
-
-    def score(self):
-        # probably need a weighting factor here
-        return self.emission_score + self.state.score()
-
-    def text(self):
-        node = self.tokens
-        out: list[str] = []
-        while node is not None:
-            out.append(node.token)
-            node = node.parent
-        return ''.join(reversed(out))
-
-    # for debugging
-    def __str__(self): return f"Beam {self.score()} {self.text()}"
+class LMGuide:
+    def children(self, beam: Beam, decoder: 'Decoder') -> Iterator[Beam]:
+        # TODO: does this need an infusion of opt_.silScore?
+        yield beam.child('|')
+        # a hack to descend into the trie
+        b = Beam(parent=beam.parent,
+                 token=beam.token,
+                 score=beam.score,
+                 lm_state=beam.lm_state,
+                 guide = decoder.trie,
+                 guides = (beam.guide, beam.guides))
+        yield from decoder.trie.children(b, decoder)
 
 class Decoder:
     tokens:    str
     criterion: str
-    root:      State
+    model:     kenlm.Model
+    trie:      TryNode
 
     beamsize: int
     beamthreshold: float
 
-    def __init__(self, tokens: str, *, criterion: str, root: State, beamsize: int=1, beamthreshold: float=math.inf):
+    def __init__(self, tokens: str, *,
+                 criterion: str, model: kenlm.Model, trie: TryNode,
+                 beamsize: int=1, beamthreshold: float=math.inf):
         if criterion == 'ctc' and not '#' in tokens:
             tokens += '#'
         self.tokens    = tokens
         self.criterion = criterion
-        self.root      = root
+        self.model     = model
+        self.trie      = trie
         self.beamsize  = beamsize
         self.beamthreshold = beamthreshold
 
@@ -162,39 +190,40 @@ class Decoder:
 
     def decode(self, x: np.array) -> list[Beam]:
         # performs beam search
-        root = Beam(state=self.root, tokens=Tokens('|', None), emission_score=0)
+        lm_state = kenlm.State()
+        self.model.BeginSentenceWrite(lm_state)
+        guide = LMGuide()
+        root = Beam(parent=None, token='|', score=0, lm_state=lm_state, guide=guide, guides=None)
         beams: list[Beam] = [root]
+
         for t, step in enumerate(x):
             new_beams: list[Beam] = []
             for parent in beams:
-                prev_token = parent.tokens.token
-                # possible next tokens
-                suggestions = {prev_token} | parent.state.suggestions()
-                if self.criterion == 'ctc': suggestions.add('#')
-                for n, token in enumerate(self.tokens):
-                    if token not in suggestions: continue
-                    score = step[n]
-                    new_beams.append(Beam(
-                        tokens = Tokens(token, parent.tokens),
-                        emission_score = score + parent.emission_score,
-                        # if token is nonblank & distinct from previous token,
-                        # we transition the model state.
-                        state = parent.state
-                                if token == prev_token or token == '#'
-                                else parent.state.transition(token)
-                    ))
+                prev_token = parent.token
+                for child in parent.guide.children(parent, self):
+                    if self.criterion == 'ctc' and child.token == prev_token: continue
+                    assert child.token != '#'
+                    child.score += step[self.tokens.index(child.token)]
+                    new_beams.append(child)
+                if self.criterion == 'ctc':
+                    for token in ['#', prev_token]:
+                        # TODO: need a silence score here for '#'?
+                        beam = parent.child(token)
+                        beam.score += step[self.tokens.index(token)]
+                        new_beams.append(beam)
             if not new_beams:
                 print("STUCK:")
                 for b in beams: print(f"   {b}")
                 return []
             beams = new_beams
             # prune beamsize
-            beams.sort(key=lambda x: x.score(), reverse=True)
+            beams.sort(key=lambda x: x.score, reverse=True)
             beams = beams[:self.beamsize]
             # prune beamthreshold
-            best_score = beams[0].score()
-            beams = [b for b in beams if b.score() >= best_score - self.beamthreshold]
-            print(f" step {t} best: {beams[0]}")
+            best_score = beams[0].score
+            beams = [b for b in beams if b.score >= best_score - self.beamthreshold]
+            if t % 10 == 0:
+                print(f" step {t} best:   {beams[0]}")
         return beams
 
     def synthetic_test(self, s: str) -> None:
@@ -205,17 +234,43 @@ class Decoder:
         if beams: print('decode()     ',  beams[0].text())
         else: print('decode() FAILED!')
         for candidate in beams:
-            print(f"{candidate.score():.3f} {candidate.text()}")
+            print(f"{candidate.score:.3f} {candidate.text()}")
+
+def load_trie(model: kenlm.Model, lexicon_path) -> TryNode:
+    print("loading trie")
+    root = TryNode(score=0, words=[], edges={})
+    with open(lexicon_path, 'r') as f:
+        for i, line in enumerate(f):
+            word, *tokens = line.split()
+            if (i+1) % 5000 == 0: print(f" {word}...", end='', flush=True)
+            # bos=False means don't assume we're at beginning of sentence
+            score = model.score(word, bos=False)
+            node = root
+            for t in tokens:
+                if t not in node.edges:
+                    node.edges[t] = TryNode(score=0, words=[], edges={})
+                node = node.edges[t]
+            node.words.append((word, score))
+
+    print("\ncalculating scores...")
+    root.smear_score()
+
+    # just to get an idea of what some trie nodes look like
+    for word in ["this", "lexicons", "airport"]:
+        node = root
+        for char in word: node = node.edges[char]
+        # print(node)
+        print(f" {word} -> {node}")
+
+    return root
 
 def main():
     tokens = "|'abcdefghijklmnopqrstuvwxyz"
-    trie = Trie(model_path=os.path.join(CONFORMER_PATH, "lm-ngram.bin"),
-                lexicon_path=os.path.join(CONFORMER_PATH, "lexicon.txt"))
-    root = State(node = trie.root)
-    decoder = Decoder(tokens, criterion='ctc', beamsize=20, root=root)
-    decoder.synthetic_test('a')
-    decoder.synthetic_test('hello')
-    # these don't decode properly yet, only handle single words so far
+    model = kenlm.Model(os.path.join(CONFORMER_PATH, "lm-ngram.bin"))
+    trie = load_trie(model, os.path.join(CONFORMER_PATH, "lexicon.txt"))
+    decoder = Decoder(tokens, criterion='ctc', beamsize=20, model=model, trie=trie)
+    decoder.synthetic_test('a ')
+    decoder.synthetic_test('hello ')
     decoder.synthetic_test('hello world ')
     decoder.synthetic_test('this is a decoder test ')
 
