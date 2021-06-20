@@ -394,6 +394,7 @@ auto BeamSearch<LM, LMStateType>::run(
             const auto& prevHyp = *hypIt;
             const auto& prevLmState = prevHyp.lmState;
             const int prevIdx = prevHyp.getToken();
+            // RNTZ: this appears to always be true?
             bool repeatPrevLex = true;
 
             /*
@@ -433,7 +434,7 @@ auto BeamSearch<LM, LMStateType>::run(
                     hadLabel = true;
                     // RNTZ: lScore is the score of the new candidate? so the score is:
                     //    emissions + lm score * opt_.lmWeight + opt_.wordScore
-                    // IF we've finished a word???
+                    // if we've finished a word.
                     float lScore = score + opt_.lmWeight * (lmScore - prevMaxScore) + opt_.wordScore;
                     beamSearchNewCandidate(
                             candidates,
@@ -481,6 +482,7 @@ auto BeamSearch<LM, LMStateType>::run(
             });
 
             /* Try same lexicon node */
+            // RNTZ: not sure what this is doing, exactly
             if (repeatPrevLex) {
                 int n = prevIdx;
                 if (opt_.criterionType == CriterionType::CTC && prevHyp.getPrevSil()) {
