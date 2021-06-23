@@ -473,6 +473,7 @@ struct State {
     // new State, new token index and whether the new state has children
     template <typename Fn>
     // RNTZ: why does this return a boolean, and why does it always return true?
+    // RNTZ: look here to understand dfa-based beam search guide
     bool forChildren(int frame, std::unordered_set<int> &indices, const LM &lm, Fn&& fn) const {
         // If a dictionary word was started only consider its trie children.
         if (dictLex) {

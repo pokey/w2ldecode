@@ -411,14 +411,17 @@ auto BeamSearch<LM, LMStateType>::run(
             std::cout << "\n";
             */
 
+            // RNTZ: I think this is always 0??? b/c prevLmState should be a
+            // DFALM::State, whose maxWordScore method returns 0.
             const float prevMaxScore = prevLmState.maxWordScore();
             /* (1) Try children */
+            // RNTZ (1) try children according to guide
             repeatPrevLex &= prevLmState.forChildren(t, indexSet, lm_, [&, prevIdx, prevMaxScore](auto lmState, int n, bool hasChildren) {
                 if (n == prevIdx && (opt_.criterionType != CriterionType::CTC || !prevHyp.getPrevBlank()))
                     repeatPrevLex = true;
                 // RNTZ: add the score of the emitted token
                 float score = prevHyp.score + emissions[frame * nTokens_ + n];
-                // RNTZ: what's going on here? What is transitions_?
+                // RNTZ: what's going on here? What is transitions_? aegis says i can ignore it.
                 if (frame > 0 && transitions_.size() > 0) {
                     score += transitions_[n * nTokens_ + prevIdx];
                 }
@@ -432,9 +435,8 @@ auto BeamSearch<LM, LMStateType>::run(
                 bool hadLabel = false;
                 lmState.forLabels(lm_, [&, prevMaxScore, score](LMStateType labelLmState, int label, float lmScore) {
                     hadLabel = true;
-                    // RNTZ: lScore is the score of the new candidate? so the score is:
-                    //    emissions + lm score * opt_.lmWeight + opt_.wordScore
-                    // if we've finished a word.
+                    // RNTZ (1a) try children - found a word!
+                    // NB. lmScore does NOT come from maxWordScore applied to some DFALM::State
                     float lScore = score + opt_.lmWeight * (lmScore - prevMaxScore) + opt_.wordScore;
                     beamSearchNewCandidate(
                             candidates,
@@ -450,6 +452,7 @@ auto BeamSearch<LM, LMStateType>::run(
 
                 // We eat-up a new token
                 if (hasChildren && (opt_.criterionType != CriterionType::CTC || prevHyp.getPrevBlank() || n != prevIdx)) {
+                    // RNTZ (1b) try children - found a non-word
                     float lScore = score + opt_.lmWeight * (lmState.maxWordScore() - prevMaxScore);
                     beamSearchNewCandidate(
                             candidates,
@@ -482,9 +485,12 @@ auto BeamSearch<LM, LMStateType>::run(
             });
 
             /* Try same lexicon node */
-            // RNTZ: not sure what this is doing, exactly
+            // RNTZ: (2) retry previous token.
             if (repeatPrevLex) {
                 int n = prevIdx;
+                // RNTZ: I don't grok this. why do we pretend n is silence if getPrevSil() holds?
+                // maybe the idea is that we want to allow silence-blank-silence sequences,
+                // which otherwise won't get suggested? not sure this accomplishes that.
                 if (opt_.criterionType == CriterionType::CTC && prevHyp.getPrevSil()) {
                     n = sil_;
                 }
@@ -497,6 +503,7 @@ auto BeamSearch<LM, LMStateType>::run(
                 }
                 score += hooks.extraNewTokenScore(frame, prevHyp, n);
 
+                // RNTZ: this is suspicious. doesn't pass prevSil or prevBlank, even if n is blank or sil.
                 beamSearchNewCandidate(
                         candidates,
                         candidatesBestScore,
@@ -510,7 +517,10 @@ auto BeamSearch<LM, LMStateType>::run(
             }
 
             /* CTC only, try blank */
+            // RNTZ: (3) try blank
             if (opt_.criterionType == CriterionType::CTC) {
+                // RNTZ: what is this next line doing and why?
+                // CONJECTURE: prevSil means 'the last nonblank token was silence'.
                 bool prevSil = (prevIdx == blank_) ? prevHyp.getPrevSil() : (prevIdx == sil_);
                 int n = blank_;
                 double score = prevHyp.score + emissions[frame * nTokens_ + n] + opt_.silScore;
@@ -523,6 +533,7 @@ auto BeamSearch<LM, LMStateType>::run(
                         score,
                         n,
                         -1,
+                        // RNTZ: this looks like the ONLY place these parameters are passed!
                         prevSil, // prevSil
                         true     // prevBlank
                         );
