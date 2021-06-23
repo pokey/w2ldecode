@@ -190,7 +190,7 @@ class Decoder:
                     assert child.token != '#'
                     child.score += step[self.tokens.index(child.token)]
                     new_beams.append(child)
-                for token in ['#', prev_token]:
+                for token in set(['#', prev_token]):
                     # TODO: need a silence score here for '#'?
                     beam = parent.child(token)
                     beam.score += step[self.tokens.index(token)]
