@@ -6,33 +6,67 @@ import numpy as np
 import kenlm
 import os
 
+CONFORMER_PATH = os.path.expanduser("~/.talon/w2l/en_US-conformer")
+
 # TODOs
 # 1. use ints for tokens instead of strs
 #
 # 2. fix the scoring. refer to the c++ code.
 #    should make a comment explaining the scoring once I grok it.
-# 2a. scoring of finishing a word is wrong.
-# 2b. mixing scores from model/emissions needs a weighting factor
+# 2a. mixing scores from model/emissions needs a weighting factor
+# 2b. various places need hyperparameters mixed in (finishing a word, silence)
 #
 # 3. factor out the LM stuff, like in aegis' example, instead of inlining kenlm code everywhere
 
-CONFORMER_PATH = os.path.expanduser("~/.talon/w2l/en_US-conformer")
-# specific to double precision
-MINUS_LOG_THRESHOLD = -39.14
 
-# Adds log-likelihoods. Returns log(exp(loga) + exp(logb)), ie: given loga =
-# log(a), logb = log(b), returns log(a + b).
+# prevLmState is DFALM::State from w2l_decode_backend.cpp -- AM I SURE?
+# because DFALM::State::maxWordScore always returns 0, which seems very wrong.
+# what is getPrevSil()?
+
+# CombinedDecoder = SimpleDecoder<DFALM::LM, DFALM::State>
+# SimpleDecoder<lm, lmstate> -> BeamSearch<lm, lmstate>
+
+# prevLmState.maxWordScore
+# prevLmState = prevHyp.lmState
+# prevHyp comes from hypIt comes from range() comes from hyp
+# hyp: vector<DecoderState>
+# BeamSearch<lm, lmstate>::DecoderState = SimpleDecoderState<lmstate>
+# SimpleDecoderState<lmstate>.lmState: lmstate
+# ie. it's a DFALM::State ?!?
+
+
+# ---------- HOW SCORING WORKS ----------
+# We generate new beams from these sources:
 #
-# Think of a, b, and a + b as probabilities. Floating point has limited
-# precision, so to manipulate probabilities it is better to represent them by
-# their logarithm, which ranges from log(0) = -inf to log(1) = 0.
-def log_add(loga, logb):
-    if loga < logb: loga, logb = logb, loga
-    minusdif = logb - loga
-    # I think this is an optimisation to avoid doing work if it wouldn't affect
-    # the result due to precision limitation, but I'm not sure.
-    if minusdif < MINUS_LOG_THRESHOLD: return loga
-    return loga + np.log1p(math.exp(minusdif))
+# 1. For each child of prevLmState (which is a DFA guide):
+#
+#    score += emission[tok] + (silScore if tok is silence or blank)
+#
+#    (1a) if found word(s)
+#    score += wordScore + lmWeight * lmDelta
+#      where lmDelta = ??? i think this is determined by 
+#
+#    (1b) if has children
+#    score += lmWeight * lmDelta
+#
+# 2. Try repeating previous token (even when not in ctc?)
+#    does something weird where it pretends tok is silence sometimes?
+#
+#    score += emission[tok] + (silScore if tok is silence or blank)
+#
+# 3. If CTC, try blank token.
+#
+#    score += emission[tok] + silScore
+#
+#
+# UNIFIED SCORING RULE:
+#
+#    score += emission[tok], always
+#    score += silScore, if tok is silence or blank
+#    score += wordScore, if found a word
+#    score += lmWeight * lmDelta, which will be 0 if we didn't transition the graph node
+#
+# I think lmDelta is determined by the DFA/LM/Trie stack, not by just the LM, despite name.
 
 # Guide is an interfaces. TODO: how do those work in mypy?
 class Guide:
@@ -76,7 +110,7 @@ class Beam:
         while stack:
             guide, stack = stack
             guides.append(guide)
-        return f"Beam {' '.join([str(x) for x in guides])} {self.score:.3f} {self.text()}"
+        return f"Beam {self.text()} {self.score:.3f} {' '.join([str(x) for x in guides])}"
 
 # implements Guide
 @dataclass
@@ -87,18 +121,6 @@ class TryNode:
 
     def __str__(self):
         return f"(TryNode {self.score:.3f} {self.words} {''.join(self.edges.keys())})"
-
-    def smear_score(self):
-        # It is strange to mix log-add and max this way. It's what the original
-        # does in SmearMode::MAX, but this may be a mistake. However, since we
-        # effectively only use log_add if there's more than one word for a given
-        # trie node, it's basically irrelevant for conformer.
-        self.score = -math.inf
-        for _, score in self.words:
-            self.score = log_add(self.score, score)
-        for child in self.edges.values():
-            child.smear_score()
-            self.score = max(self.score, child.score)
 
     def children(self, beam: Beam, decoder: 'Decoder') -> Iterator[Beam]:
         for token, node in self.edges.items():
@@ -111,11 +133,8 @@ class TryNode:
                 new_lm_state = kenlm.State()
                 score = decoder.model.BaseScore(beam.lm_state, word, new_lm_state)
                 # TODO: probably want to add opt_.word_score here/somewhere?
-                # TODO: why is this score rather than score - node.score?
-                # seems to give better results on the fake emissions, but probably not quite right.
-                # need to go reread the c++ code.
-                # seems like the c++ actually uses the previous lm state's score to calculate this?
-                b = beam.child(token, score)
+                # should this be score or (score - node.score)?
+                b = beam.child(token, score - node.score)
                 # print(f"found word: {word}, delta {score - self.score:.3f}, score {b.score}")
                 b.guide, b.guides = beam.guides
                 b.lm_state = new_lm_state
@@ -137,7 +156,6 @@ class LMGuide:
 
 class Decoder:
     tokens:    str
-    criterion: str
     model:     kenlm.Model
     trie:      TryNode
 
@@ -145,48 +163,15 @@ class Decoder:
     beamthreshold: float
 
     def __init__(self, tokens: str, *,
-                 criterion: str, model: kenlm.Model, trie: TryNode,
+                 model: kenlm.Model, trie: TryNode,
                  beamsize: int=1, beamthreshold: float=math.inf):
-        if criterion == 'ctc' and not '#' in tokens:
-            tokens += '#'
+        assert '#' not in tokens
+        tokens += '#'
         self.tokens    = tokens
-        self.criterion = criterion
         self.model     = model
         self.trie      = trie
         self.beamsize  = beamsize
         self.beamthreshold = beamthreshold
-
-    def fake_encode(self, s: str) -> np.array:
-        # generates a fake emissions matrix
-        if self.criterion == 'ctc':
-            tmp: list[str] = []
-            # add CTC blanks where necessary
-            for i, c in enumerate(s):
-                tmp.append(c)
-                if i < len(s)-1 and c == s[i+1]:
-                    tmp.append('#')
-            s = ''.join(tmp)
-        s = s.replace(' ', '|')
-
-        out = np.zeros((0, len(self.tokens)))
-        for c in s:
-            width = random.randint(3, 5) if c != '#' else 1
-            for i in range(width):
-                x = np.random.rand(1, len(self.tokens)) * 9.99
-                x[0,self.tokens.index(c)] = 10
-                out = np.concatenate([out, x])
-        return out
-
-    def greedy_decode(self, x: np.array, *, short=False) -> str:
-        if self.criterion == 'ctc':
-            idx = [np.argmax(step) for step in x]
-            out = ''.join([self.tokens[i] for i in idx])
-            if short:
-                out = ''.join([c for i, c in enumerate(out)
-                               if i == 0 or c != out[i-1]])
-                out = out.replace('#', '').replace('|', ' ')
-            return out
-        raise NotImplementedError
 
     def decode(self, x: np.array) -> list[Beam]:
         # performs beam search
@@ -201,16 +186,15 @@ class Decoder:
             for parent in beams:
                 prev_token = parent.token
                 for child in parent.guide.children(parent, self):
-                    if self.criterion == 'ctc' and child.token == prev_token: continue
+                    if child.token == prev_token: continue
                     assert child.token != '#'
                     child.score += step[self.tokens.index(child.token)]
                     new_beams.append(child)
-                if self.criterion == 'ctc':
-                    for token in ['#', prev_token]:
-                        # TODO: need a silence score here for '#'?
-                        beam = parent.child(token)
-                        beam.score += step[self.tokens.index(token)]
-                        new_beams.append(beam)
+                for token in ['#', prev_token]:
+                    # TODO: need a silence score here for '#'?
+                    beam = parent.child(token)
+                    beam.score += step[self.tokens.index(token)]
+                    new_beams.append(beam)
             if not new_beams:
                 print("STUCK:")
                 for b in beams: print(f"   {b}")
@@ -222,19 +206,88 @@ class Decoder:
             # prune beamthreshold
             best_score = beams[0].score
             beams = [b for b in beams if b.score >= best_score - self.beamthreshold]
-            if t % 10 == 0:
+            if t % 1 == 0:
                 print(f" step {t} best:   {beams[0]}")
+            for b in beams:
+                print(f" {b} -> {self.shorten(b.text())}")
+
+        # TODO: need a finishing step where I discard beams that are in the
+        # middle of parsing a word.
         return beams
 
+    def greedy_decode(self, x: np.array) -> str:
+        idx = [np.argmax(step) for step in x]
+        return ''.join([self.tokens[i] for i in idx])
+
+    def shorten(self, text: str) -> str:
+        out = ''.join([c for i, c in enumerate(text) if i == 0 or c != text[i-1]])
+        return out.replace('#', '').replace('|', ' ')
+
+    def fake_encode(self, s: str) -> np.array:
+        """Generate a fake emissions matrix"""
+        # add CTC blanks '#' where necessary
+        tmp: list[str] = []
+        for i, c in enumerate(s):
+            tmp.append(c)
+            if i < len(s)-1 and c == s[i+1]:
+                tmp.append('#')
+        s = ''.join(tmp)
+
+        # use '|' to represent word breaks
+        s = s.replace(' ', '|')
+
+        out = np.zeros((0, len(self.tokens)))
+        for c in s:
+            width = random.randint(3, 5) if c != '#' else 1
+            for i in range(width):
+                x = np.random.rand(1, len(self.tokens)) * 9.99
+                x[0,self.tokens.index(c)] = 10
+                out = np.concatenate([out, x])
+        return out
+
     def synthetic_test(self, s: str) -> None:
-        x = self.fake_encode(s)
+        self.test(self.fake_encode(s))
+
+    def test(self, x: np.array) -> None:
+        print('greedy(short)',  self.shorten(self.greedy_decode(x)))
         print('greedy()     ',  self.greedy_decode(x))
-        print('greedy(short)',  self.greedy_decode(x, short=True))
         beams = self.decode(x)
-        if beams: print('decode()     ',  beams[0].text())
+        if beams: print('decode()     ',  self.shorten(beams[0].text()))
         else: print('decode() FAILED!')
         for candidate in beams:
             print(f"{candidate.score:.3f} {candidate.text()}")
+
+
+# ---------- TRIE LOADING ----------
+# specific to double precision
+MINUS_LOG_THRESHOLD = -39.14
+
+# Adds log-likelihoods. Returns log(exp(loga) + exp(logb)), ie: given loga =
+# log(a), logb = log(b), returns log(a + b).
+#
+# Think of a, b, and a + b as probabilities. Floating point has limited
+# precision, so to manipulate probabilities it is better to represent them by
+# their logarithm, which ranges from log(0) = -inf to log(1) = 0.
+def log_add(loga, logb):
+    if loga < logb: loga, logb = logb, loga
+    minusdif = logb - loga
+    # I think this is an optimisation to avoid doing work if it wouldn't affect
+    # the result due to precision limitation, but I'm not sure.
+    if minusdif < MINUS_LOG_THRESHOLD: return loga
+    return loga + np.log1p(math.exp(minusdif))
+
+def smear_score(node):
+    """calculate the score for a try node"""
+    # It is strange to mix log-add and max this way. It's what the original
+    # does in SmearMode::MAX, but this may be a mistake. However, since we
+    # effectively only use log_add if there's more than one word for a given
+    # trie node, it's basically irrelevant for conformer.
+    node.score = -math.inf
+    for _, score in node.words:
+        node.score = log_add(node.score, score)
+    for child in node.edges.values():
+        smear_score(child)
+        node.score = max(node.score, child.score)
 
 def load_trie(model: kenlm.Model, lexicon_path) -> TryNode:
     print("loading trie")
@@ -253,25 +306,33 @@ def load_trie(model: kenlm.Model, lexicon_path) -> TryNode:
             node.words.append((word, score))
 
     print("\ncalculating scores...")
-    root.smear_score()
+    smear_score(root)
 
     # just to get an idea of what some trie nodes look like
     for word in ["this", "lexicons", "airport"]:
         node = root
         for char in word: node = node.edges[char]
-        # print(node)
         print(f" {word} -> {node}")
 
     return root
 
+
+# ---------- TESTING ----------
 def main():
     tokens = "|'abcdefghijklmnopqrstuvwxyz"
     model = kenlm.Model(os.path.join(CONFORMER_PATH, "lm-ngram.bin"))
     trie = load_trie(model, os.path.join(CONFORMER_PATH, "lexicon.txt"))
-    decoder = Decoder(tokens, criterion='ctc', beamsize=20, model=model, trie=trie)
+    decoder = Decoder(tokens, beamsize=20, model=model, trie=trie)
     decoder.synthetic_test('a ')
     decoder.synthetic_test('hello ')
     decoder.synthetic_test('hello world ')
     decoder.synthetic_test('this is a decoder test ')
+
+    print("---------- REAL DATA ----------")
+    for n in "a hello hello_world this_is_a_decoder_test".split():
+        filename = f'emit_tests/emit_{n}.npy'
+        data = np.load(filename)
+        print(f'\n# {filename}')
+        decoder.test(data)
 
 if __name__ == '__main__': main()
