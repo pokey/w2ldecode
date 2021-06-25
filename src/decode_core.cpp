@@ -492,6 +492,7 @@ auto BeamSearch<LM, LMStateType>::run(
                 // maybe the idea is that we want to allow silence-blank-silence sequences,
                 // which otherwise won't get suggested? not sure this accomplishes that.
                 if (opt_.criterionType == CriterionType::CTC && prevHyp.getPrevSil()) {
+                    // I believe this will only happen if the previous token is a ctc blank
                     n = sil_;
                 }
                 float score = prevHyp.score + emissions[frame * nTokens_ + n];
