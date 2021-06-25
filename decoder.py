@@ -8,15 +8,20 @@ import os
 
 CONFORMER_PATH = os.path.expanduser("~/.talon/w2l/en_US-conformer")
 
-# TODOs
-# 1. use ints for tokens instead of strs
+# ---------- TODOs ----------
+# 
+# 1. We need to deduplicate states. Figure out based on what.
+# https://github.com/talonvoice/w2ldecode/blob/master/src/decode_core.cpp#L219
+# https://github.com/rntz/w2ldecode/blob/master/src/decode_core.cpp#L220
 #
-# 2. fix the scoring. refer to the c++ code.
+# 2. use ints for tokens instead of strs
+#
+# 3. fix the scoring. refer to the c++ code.
 #    should make a comment explaining the scoring once I grok it.
-# 2a. mixing scores from model/emissions needs a weighting factor
-# 2b. various places need hyperparameters mixed in (finishing a word, silence)
+# 3a. mixing scores from model/emissions needs a weighting factor
+# 3b. various places need hyperparameters mixed in (finishing a word, silence)
 #
-# 3. factor out the LM stuff, like in aegis' example, instead of inlining kenlm code everywhere
+# 4. factor out the LM stuff, like in aegis' example, instead of inlining kenlm code everywhere
 
 
 # prevLmState is DFALM::State from w2l_decode_backend.cpp -- AM I SURE?
@@ -69,6 +74,10 @@ CONFORMER_PATH = os.path.expanduser("~/.talon/w2l/en_US-conformer")
 # I think lmDelta is determined by the DFA/LM/Trie stack, not by just the LM, despite name.
 
 # Guide is an interfaces. TODO: how do those work in mypy?
+# The information we need for a transition is:
+# 1. The token
+# 2. (Whether we matched a word & the updated language model state) OR (the word we matched)
+# 3. The delta to the score according to the guide
 class Guide:
     def children(self, beam: 'Beam', decoder: 'Decoder') -> Iterator['Beam']:
         raise NotImplementedError
@@ -143,15 +152,18 @@ class TryNode:
 @dataclass
 class LMGuide:
     def children(self, beam: Beam, decoder: 'Decoder') -> Iterator[Beam]:
-        # TODO: does this need an infusion of opt_.silScore?
+        # if we are between words, we always suggest silence '|' followed by
+        # same state. I think this accomplishes the equivalent of the logic
+        # surrounding getPrevSil() in the c++? but, is this mixing in ctc logic
+        # where it shouldn't be? TODO: needs an infusion of opt_.silScore
         yield beam.child('|')
-        # a hack to descend into the trie
-        b = Beam(parent=beam.parent,
-                 token=beam.token,
-                 score=beam.score,
-                 lm_state=beam.lm_state,
-                 guide = decoder.trie,
-                 guides = (beam.guide, beam.guides))
+        # a hack to descend into the trie:
+        b = Beam(
+            # copy beam...
+            parent=beam.parent, token=beam.token, score=beam.score, lm_state=beam.lm_state,
+            # ... but push trie onto the guide stack ...
+            guide = decoder.trie, guides = (beam.guide, beam.guides))
+        # ... then call trie to find appropriate children
         yield from decoder.trie.children(b, decoder)
 
 class Decoder:
@@ -201,15 +213,16 @@ class Decoder:
                 return []
             beams = new_beams
             # prune beamsize
+            # TODO: do some deduplication at this point
             beams.sort(key=lambda x: x.score, reverse=True)
             beams = beams[:self.beamsize]
             # prune beamthreshold
             best_score = beams[0].score
             beams = [b for b in beams if b.score >= best_score - self.beamthreshold]
-            if t % 1 == 0:
-                print(f" step {t} best:   {beams[0]}")
-            for b in beams:
-                print(f" {b} -> {self.shorten(b.text())}")
+            # if t % 1 == 0:
+            #     print(f" step {t} best:   {beams[0]}")
+            # for b in beams:
+            #     print(f" {b} -> {self.shorten(b.text())}")
 
         # TODO: need a finishing step where I discard beams that are in the
         # middle of parsing a word.
@@ -322,7 +335,7 @@ def main():
     tokens = "|'abcdefghijklmnopqrstuvwxyz"
     model = kenlm.Model(os.path.join(CONFORMER_PATH, "lm-ngram.bin"))
     trie = load_trie(model, os.path.join(CONFORMER_PATH, "lexicon.txt"))
-    decoder = Decoder(tokens, beamsize=20, model=model, trie=trie)
+    decoder = Decoder(tokens, beamsize=100, model=model, trie=trie)
     decoder.synthetic_test('a ')
     decoder.synthetic_test('hello ')
     decoder.synthetic_test('hello world ')
