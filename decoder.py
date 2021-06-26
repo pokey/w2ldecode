@@ -276,7 +276,7 @@ class Decoder:
             new_beams.sort(key=lambda x: x.score, reverse=True)
             beams = []
             for b in new_beams:
-                # deduplicate, THIS IS VERY INEFFICIENT -- want hashing!
+                # deduplicate, THIS IS QUADRATICALLY INEFFICIENT -- want hashing!
                 if any(b.same(b2) for b2 in beams): continue
                 beams.append(b)
                 if len(beams) >= self.beamsize: break
