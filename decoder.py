@@ -10,15 +10,6 @@ CONFORMER_PATH = os.path.expanduser("~/.talon/w2l/en_US-conformer")
 
 # ---------- TODOs ----------
 # 
-# 1. We need to deduplicate states. Figure out based on what.
-# https://github.com/talonvoice/w2ldecode/blob/master/src/decode_core.cpp#L219
-# decode_core.cpp:25        	KenFlatTrieLM::State::Equality
-# w2l_decode_backend.cpp:428	DFALM::State::Equality <---
-# checks equality of:
-# - dfa node
-# - trie position
-# - lm state (these are memoized in a trie per-decode to avoid duplicates)
-#   check out fl-derived/LM.h etc.
 #
 # 2. use ints for tokens instead of strs
 #
@@ -26,8 +17,6 @@ CONFORMER_PATH = os.path.expanduser("~/.talon/w2l/en_US-conformer")
 #    should make a comment explaining the scoring once I grok it.
 # 3a. mixing scores from model/emissions needs a weighting factor
 # 3b. various places need hyperparameters mixed in (finishing a word, silence)
-#
-# 4. factor out the LM stuff, like in aegis' example, instead of inlining kenlm code everywhere
 
 
 # prevLmState is DFALM::State from w2l_decode_backend.cpp -- AM I SURE?
@@ -155,6 +144,14 @@ class Beam:
         return Beam(parent = self, token = token, score = self.score + score_delta,
                     lm_state = self.lm_state, guide=self.guide, guides=self.guides)
 
+    # REFERENCES FOR BEAM DEDUPLICATION
+    # https://github.com/talonvoice/w2ldecode/blob/master/src/decode_core.cpp#L219
+    # w2l_decode_backend.cpp:428	DFALM::State::Equality
+    # checks equality of:
+    # - dfa node
+    # - trie position
+    # - lm state (these are memoized in a trie per-decode to avoid duplicates)
+    #   check out fl-derived/LM.h etc.
     def same(self, other: 'Beam') -> bool:
         """Determines whether two beams are in essentially the same state, ignoring details of how they got there -- ie. score/exact token sequence doesn't matter, but recognized words and the guide/graph stack do."""
         # NB. lm state construction is memoized by the word sequence visited, so
