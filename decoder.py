@@ -9,8 +9,6 @@ import os
 CONFORMER_PATH = os.path.expanduser("~/.talon/w2l/en_US-conformer")
 
 # ---------- TODOs ----------
-# 
-#
 # 2. use ints for tokens instead of strs
 #
 # 3. fix the scoring. refer to the c++ code.
@@ -38,7 +36,7 @@ CONFORMER_PATH = os.path.expanduser("~/.talon/w2l/en_US-conformer")
 # ---------- HOW SCORING WORKS ----------
 # We generate new beams from these sources:
 #
-# 1. For each child of prevLmState (which is a DFA guide):
+# 1. For each child of prevLmState (which is a DFA node):
 #
 #    score += emission[tok] + (silScore if tok is silence or blank)
 #
@@ -112,17 +110,24 @@ class LM:
         return score, child
 
 
-# ---------- BEAMS AND GUIDES ----------
-# Guide is an interfaces. TODO: how do those work in mypy?
-# The information we need for a transition is:
-# 1. The token
-# 2. (Whether we matched a word & the updated language model state) OR (the word we matched)
-# 3. The delta to the score according to the guide
-class Guide:
-    def children(self, beam: 'Beam', decoder: 'Decoder') -> Iterator['Beam']:
-        raise NotImplementedError
+# ---------- BEAMS ----------
+@dataclass
+class Transition:
+    token: str            # token accepted
+    score: float          # score of the transition, according to the graph node
+    lm_state: LMState     # new LM state
+    node: 'GraphNode'     # new graph node & stack
+    stack: 'GraphStack'
 
-GuideStack = Optional[tuple[Guide, 'GuideStack']]
+GraphStack = Optional[tuple['GraphNode', 'GraphStack']]
+# GraphNode is an interface. TODO: how do those work in mypy?
+class GraphNode:
+    def children(self,
+                 decoder: 'Decoder',
+                 lm_state: LMState,
+                 # is only handed the stack above it, not itself
+                 stack: GraphStack) -> Iterator[Transition]:
+        raise NotImplementedError
 
 @dataclass
 class Beam:
@@ -133,16 +138,8 @@ class Beam:
     # LM state, preserved across multiple invocations of LM
     lm_state: LMState
     # state used to guide the search
-    guide: Guide
-    guides: GuideStack
-
-    def child(self, token, score_delta = 0) -> 'Beam':
-        # the point of putting score_delta here is that scores coming from
-        # emissions and scores coming from model/graph/dfa should be weighted
-        # differently eventually and this was the only place I could find to
-        # centralize contributions from the model/graph/dfa. kinda ugly :/
-        return Beam(parent = self, token = token, score = self.score + score_delta,
-                    lm_state = self.lm_state, guide=self.guide, guides=self.guides)
+    node: GraphNode
+    stack: GraphStack
 
     # REFERENCES FOR BEAM DEDUPLICATION
     # https://github.com/talonvoice/w2ldecode/blob/master/src/decode_core.cpp#L219
@@ -153,20 +150,18 @@ class Beam:
     # - lm state (these are memoized in a trie per-decode to avoid duplicates)
     #   check out fl-derived/LM.h etc.
     def same(self, other: 'Beam') -> bool:
-        """Determines whether two beams are in essentially the same state, ignoring details of how they got there -- ie. score/exact token sequence doesn't matter, but recognized words and the guide/graph stack do."""
+        """Determines whether two beams are in essentially the same state, ignoring details of how they got there -- ie. score/exact token sequence doesn't matter, but recognized words and the graph stack do."""
         # NB. lm state construction is memoized by the word sequence visited, so
         # lm state pointer equality determines whether the words we've seen are
-        # the same. Currently all guides can also be compared by pointer
+        # the same. Currently all graph nodes can also be compared by pointer
         # equality -- might need to change that later, in which case, implement
-        # __eq__ on guides to avoid deep comparison.
-        g1, g2 = self.guides, other.guides
-        while g1 and g2:
-            x, g1 = g1
-            y, g2 = g2
+        # __eq__ on graph nodes to avoid deep comparison.
+        xs, ys = (self.node, self.stack), (other.node, other.stack)
+        while xs and ys:
+            x, xs = xs
+            y, ys = ys
             if x is not y: return False
-        return (g1 is g2 and
-                self.lm_state is other.lm_state and
-                self.guide is other.guide)
+        return (xs is ys and self.lm_state is other.lm_state)
     
     def text(self):
         node = self
@@ -178,14 +173,14 @@ class Beam:
 
     # for debugging
     def __str__(self):
-        guides = [self.guide]
-        stack = self.guides
+        nodes = []
+        stack = (self.node, self.stack)
         while stack:
-            guide, stack = stack
-            guides.append(guide)
-        return f"Beam {self.text()} {self.score:.3f} {' '.join([str(x) for x in guides])}"
+            node, stack = stack
+            nodes.append(node)
+        return f"Beam {self.text()} {self.score:.3f} {' '.join([str(x) for x in nodes])}"
 
-# implements Guide
+# implements GraphNode
 @dataclass
 class TryNode:
     score: float
@@ -195,41 +190,32 @@ class TryNode:
     def __str__(self):
         return f"(TryNode {self.score:.3f} {self.words} {''.join(self.edges.keys())})"
 
-    def children(self, beam: Beam, decoder: 'Decoder') -> Iterator[Beam]:
+    def children(self, decoder, lm_state, stack) -> Iterator[Transition]:
         for token, node in self.edges.items():
             if node.edges:      # avoid dead-ending
-                b = beam.child(token, node.score - self.score)
-                b.guide = node
-                yield b
+                yield Transition(token, node.score - self.score, lm_state, node, stack)
             for word, _ in node.words:
                 assert token == '|'
-                word_score, new_lm_state = decoder.lm.score(beam.lm_state, word)
+                word_score, new_lm_state = decoder.lm.score(lm_state, word)
                 # TODO: probably want to add opt_.word_score here/somewhere?
                 # should this be (word_score - node.score) or just word_score?
                 # (word_score - node.score) makes more sense: replace the trie score.
                 # but just word_score seems to produce better results?!
-                b = beam.child(token, word_score - node.score)
-                # print(f"found word: {word}, delta {score - self.score:.3f}, score {b.score}")
-                b.guide, b.guides = beam.guides
-                b.lm_state = new_lm_state
-                yield b
+                score = word_score - node.score
+                yield Transition(token, score, new_lm_state, stack[0], stack[1])
 
+# implements GraphNode
 @dataclass
-class LMGuide:
-    def children(self, beam: Beam, decoder: 'Decoder') -> Iterator[Beam]:
+class LMGraphNode:
+    def children(self, decoder, lm_state, stack) -> Iterator[Transition]:
         # if we are between words, we always suggest silence '|' followed by
         # same state. I think this accomplishes the equivalent of the logic
         # surrounding getPrevSil() in the c++? but, is this mixing in ctc logic
-        # where it shouldn't be? TODO: needs an infusion of opt_.silScore
-        yield beam.child('|')
-        # a hack to descend into the trie:
-        b = Beam(
-            # copy beam...
-            parent=beam.parent, token=beam.token, score=beam.score, lm_state=beam.lm_state,
-            # ... but push trie onto the guide stack ...
-            guide = decoder.trie, guides = (beam.guide, beam.guides))
-        # ... then call trie to find appropriate children
-        yield from decoder.trie.children(b, decoder)
+        # where it shouldn't be?
+        yield Transition('|', 0, lm_state, self, stack)
+        # Ask trie to find appropriate children, pushing self on stack.
+        for t in decoder.trie.children(decoder, lm_state, (self, stack)):
+            yield t
 
 class Decoder:
     tokens:    str
@@ -256,24 +242,31 @@ class Decoder:
                     token='|',
                     score=0,
                     lm_state=self.lm.initial_state(),
-                    guide=LMGuide(),
-                    guides=None)
+                    node=LMGraphNode(),
+                    stack=None)
         beams: list[Beam] = [root]
 
         for t, step in enumerate(x):
             new_beams: list[Beam] = []
             for parent in beams:
                 prev_token = parent.token
-                for child in parent.guide.children(parent, self):
-                    if child.token == prev_token: continue
-                    assert child.token != '#'
-                    child.score += step[self.tokens.index(child.token)]
-                    new_beams.append(child)
-                for token in set(['#', prev_token]):
-                    # TODO: need a silence score here for '#'?
-                    beam = parent.child(token)
-                    beam.score += step[self.tokens.index(token)]
-                    new_beams.append(beam)
+                def transitions():
+                    for t in parent.node.children(self, parent.lm_state, parent.stack):
+                        # don't allow recurrences of the same token without intervening blank
+                        if t.token == prev_token: continue
+                        yield t
+                    # suggest blank and the same token without changing graph node
+                    for token in set(['#', prev_token]):
+                        yield Transition(token, 0, parent.lm_state, parent.node, parent.stack)
+                for t in transitions():
+                    new_beams.append(Beam(
+                        parent = parent,
+                        token = t.token,
+                        # TODO: add in silscore if appropriate
+                        score = parent.score + step[self.tokens.index(t.token)] + t.score,
+                        lm_state = t.lm_state,
+                        node = t.node,
+                        stack = t.stack))
 
             if not new_beams:
                 print("STUCK:")
