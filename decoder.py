@@ -229,10 +229,10 @@ class Decoder:
                  beamsize: int=1, beamthreshold: float=math.inf):
         assert '#' not in tokens
         tokens += '#'
-        self.tokens    = tokens
-        self.lm     = lm
-        self.trie      = trie
-        self.beamsize  = beamsize
+        self.tokens        = tokens
+        self.lm            = lm
+        self.trie          = trie
+        self.beamsize      = beamsize
         self.beamthreshold = beamthreshold
 
     def decode(self, x: np.array) -> list[Beam]:
