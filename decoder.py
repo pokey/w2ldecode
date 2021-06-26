@@ -84,7 +84,7 @@ class LM:
     model: kenlm.Model
 
     def __init__(self, path):
-        self.model = kenlm.Model(os.path.join(CONFORMER_PATH, "lm-ngram.bin"))
+        self.model = kenlm.Model(path)
 
     def score_word(self, word):
         """1-gram scoring"""
