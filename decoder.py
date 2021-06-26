@@ -68,17 +68,12 @@ CONFORMER_PATH = os.path.expanduser("~/.talon/w2l/en_US-conformer")
 
 
 # ---------- LANGUAGE MODEL ----------
+@dataclass
 class LMState:
     ken_state: kenlm.State
     # map from words to successor states. TODO: use word indices.
     # (what's the API for that in kenlm's python bindings?)
     children: dict[str, 'LMState']
-
-    def __init__(self):
-        # NB. don't use ken_state w/o first initializing it somehow, eg. via
-        # kenlm.BeginSentenceWrite or kenlm.BaseScore.
-        self.ken_state = kenlm.State()
-        self.children = {}
 
 class LM:
     model: kenlm.Model
@@ -94,17 +89,17 @@ class LM:
     def initial_state(self):
         # We create this per-decode because each LMState memoizes creation of
         # child states, and we don't want to keep that memory allocated forever.
-        root = LMState()
+        state = LMState(kenlm.State(), {})
         # BeginSentenceWrite: initializes assuming beginning of sentence
         # NullContextWrite:   initializes w/o assuming beginning of sentence
-        self.model.NullContextWrite(root.ken_state)
-        return root
+        self.model.NullContextWrite(state.ken_state)
+        return state
 
     def score(self, state: LMState, word: str) -> (float, LMState):
         """Returns (word score, child state)."""
         # Memoize construction.
         try: child = state.children[word]
-        except KeyError: child = state.children[word] = LMState()
+        except KeyError: child = state.children[word] = LMState(kenlm.State(), {})
         # NB. modifies child.ken_state
         score = self.model.BaseScore(state.ken_state, word, child.ken_state)
         return score, child
