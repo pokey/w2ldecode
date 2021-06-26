@@ -12,7 +12,13 @@ CONFORMER_PATH = os.path.expanduser("~/.talon/w2l/en_US-conformer")
 # 
 # 1. We need to deduplicate states. Figure out based on what.
 # https://github.com/talonvoice/w2ldecode/blob/master/src/decode_core.cpp#L219
-# https://github.com/rntz/w2ldecode/blob/master/src/decode_core.cpp#L220
+# decode_core.cpp:25        	KenFlatTrieLM::State::Equality
+# w2l_decode_backend.cpp:428	DFALM::State::Equality <---
+# checks equality of:
+# - dfa node
+# - trie position
+# - lm state (these are memoized in a trie per-decode to avoid duplicates)
+#   check out fl-derived/LM.h etc.
 #
 # 2. use ints for tokens instead of strs
 #
@@ -73,6 +79,51 @@ CONFORMER_PATH = os.path.expanduser("~/.talon/w2l/en_US-conformer")
 #
 # I think lmDelta is determined by the DFA/LM/Trie stack, not by just the LM, despite name.
 
+
+# ---------- LANGUAGE MODEL ----------
+class LMState:
+    ken_state: kenlm.State
+    # map from words to successor states. TODO: use word indices.
+    # (what's the API for that in kenlm's python bindings?)
+    children: dict[str, 'LMState']
+
+    def __init__(self):
+        # NB. don't use ken_state w/o first initializing it somehow, eg. via
+        # kenlm.BeginSentenceWrite or kenlm.BaseScore.
+        self.ken_state = kenlm.State()
+        self.children = {}
+
+class LM:
+    model: kenlm.Model
+
+    def __init__(self, path):
+        self.model = kenlm.Model(os.path.join(CONFORMER_PATH, "lm-ngram.bin"))
+
+    def score_word(self, word):
+        """1-gram scoring"""
+        # bos=False means don't treat this as beginning of sentence
+        return self.model.score(word, bos=False)
+
+    def initial_state(self):
+        # We create this per-decode because each LMState memoizes creation of
+        # child states, and we don't want to keep that memory allocated forever.
+        root = LMState()
+        # BeginSentenceWrite: initializes assuming beginning of sentence
+        # NullContextWrite:   initializes w/o assuming beginning of sentence
+        self.model.NullContextWrite(root.ken_state)
+        return root
+
+    def score(self, state: LMState, word: str) -> (float, LMState):
+        """Returns (word score, child state)."""
+        # Memoize construction.
+        try: child = state.children[word]
+        except KeyError: child = state.children[word] = LMState()
+        # NB. modifies child.ken_state
+        score = self.model.BaseScore(state.ken_state, word, child.ken_state)
+        return score, child
+
+
+# ---------- BEAMS AND GUIDES ----------
 # Guide is an interfaces. TODO: how do those work in mypy?
 # The information we need for a transition is:
 # 1. The token
@@ -91,7 +142,7 @@ class Beam:
     token: str
     score: float
     # LM state, preserved across multiple invocations of LM
-    lm_state: kenlm.State
+    lm_state: LMState
     # state used to guide the search
     guide: Guide
     guides: GuideStack
@@ -104,6 +155,22 @@ class Beam:
         return Beam(parent = self, token = token, score = self.score + score_delta,
                     lm_state = self.lm_state, guide=self.guide, guides=self.guides)
 
+    def same(self, other: 'Beam') -> bool:
+        """Determines whether two beams are in essentially the same state, ignoring details of how they got there -- ie. score/exact token sequence doesn't matter, but recognized words and the guide/graph stack do."""
+        # NB. lm state construction is memoized by the word sequence visited, so
+        # lm state pointer equality determines whether the words we've seen are
+        # the same. Currently all guides can also be compared by pointer
+        # equality -- might need to change that later, in which case, implement
+        # __eq__ on guides to avoid deep comparison.
+        g1, g2 = self.guides, other.guides
+        while g1 and g2:
+            x, g1 = g1
+            y, g2 = g2
+            if x is not y: return False
+        return (g1 is g2 and
+                self.lm_state is other.lm_state and
+                self.guide is other.guide)
+    
     def text(self):
         node = self
         out: list[str] = []
@@ -139,11 +206,12 @@ class TryNode:
                 yield b
             for word, _ in node.words:
                 assert token == '|'
-                new_lm_state = kenlm.State()
-                score = decoder.model.BaseScore(beam.lm_state, word, new_lm_state)
+                word_score, new_lm_state = decoder.lm.score(beam.lm_state, word)
                 # TODO: probably want to add opt_.word_score here/somewhere?
-                # should this be score or (score - node.score)?
-                b = beam.child(token, score - node.score)
+                # should this be (word_score - node.score) or just word_score?
+                # (word_score - node.score) makes more sense: replace the trie score.
+                # but just word_score seems to produce better results?!
+                b = beam.child(token, word_score - node.score)
                 # print(f"found word: {word}, delta {score - self.score:.3f}, score {b.score}")
                 b.guide, b.guides = beam.guides
                 b.lm_state = new_lm_state
@@ -168,29 +236,31 @@ class LMGuide:
 
 class Decoder:
     tokens:    str
-    model:     kenlm.Model
+    lm:        LM
     trie:      TryNode
 
     beamsize: int
     beamthreshold: float
 
     def __init__(self, tokens: str, *,
-                 model: kenlm.Model, trie: TryNode,
+                 lm: LM, trie: TryNode,
                  beamsize: int=1, beamthreshold: float=math.inf):
         assert '#' not in tokens
         tokens += '#'
         self.tokens    = tokens
-        self.model     = model
+        self.lm     = lm
         self.trie      = trie
         self.beamsize  = beamsize
         self.beamthreshold = beamthreshold
 
     def decode(self, x: np.array) -> list[Beam]:
         # performs beam search
-        lm_state = kenlm.State()
-        self.model.BeginSentenceWrite(lm_state)
-        guide = LMGuide()
-        root = Beam(parent=None, token='|', score=0, lm_state=lm_state, guide=guide, guides=None)
+        root = Beam(parent=None,
+                    token='|',
+                    score=0,
+                    lm_state=self.lm.initial_state(),
+                    guide=LMGuide(),
+                    guides=None)
         beams: list[Beam] = [root]
 
         for t, step in enumerate(x):
@@ -207,16 +277,22 @@ class Decoder:
                     beam = parent.child(token)
                     beam.score += step[self.tokens.index(token)]
                     new_beams.append(beam)
+
             if not new_beams:
                 print("STUCK:")
                 for b in beams: print(f"   {b}")
                 return []
-            beams = new_beams
-            # prune beamsize
-            # TODO: do some deduplication at this point
-            beams.sort(key=lambda x: x.score, reverse=True)
-            beams = beams[:self.beamsize]
-            # prune beamthreshold
+
+            # prune and deduplicate beams down to beamsize
+            new_beams.sort(key=lambda x: x.score, reverse=True)
+            beams = []
+            for b in new_beams:
+                # deduplicate, THIS IS VERY INEFFICIENT -- want hashing!
+                if any(b.same(b2) for b2 in beams): continue
+                beams.append(b)
+                if len(beams) >= self.beamsize: break
+
+            # prune by beamthreshold
             best_score = beams[0].score
             beams = [b for b in beams if b.score >= best_score - self.beamthreshold]
             # if t % 1 == 0:
@@ -270,7 +346,7 @@ class Decoder:
         for candidate in beams:
             print(f"{candidate.score:.3f} {candidate.text()}")
 
-
+
 # ---------- TRIE LOADING ----------
 # specific to double precision
 MINUS_LOG_THRESHOLD = -39.14
@@ -302,7 +378,7 @@ def smear_score(node):
         smear_score(child)
         node.score = max(node.score, child.score)
 
-def load_trie(model: kenlm.Model, lexicon_path) -> TryNode:
+def load_trie(lm: LM, lexicon_path) -> TryNode:
     print("loading trie")
     root = TryNode(score=0, words=[], edges={})
     with open(lexicon_path, 'r') as f:
@@ -310,7 +386,7 @@ def load_trie(model: kenlm.Model, lexicon_path) -> TryNode:
             word, *tokens = line.split()
             if (i+1) % 5000 == 0: print(f" {word}...", end='', flush=True)
             # bos=False means don't assume we're at beginning of sentence
-            score = model.score(word, bos=False)
+            score = lm.score_word(word)
             node = root
             for t in tokens:
                 if t not in node.edges:
@@ -333,13 +409,13 @@ def load_trie(model: kenlm.Model, lexicon_path) -> TryNode:
 # ---------- TESTING ----------
 def main():
     tokens = "|'abcdefghijklmnopqrstuvwxyz"
-    model = kenlm.Model(os.path.join(CONFORMER_PATH, "lm-ngram.bin"))
-    trie = load_trie(model, os.path.join(CONFORMER_PATH, "lexicon.txt"))
-    decoder = Decoder(tokens, beamsize=100, model=model, trie=trie)
-    decoder.synthetic_test('a ')
-    decoder.synthetic_test('hello ')
-    decoder.synthetic_test('hello world ')
-    decoder.synthetic_test('this is a decoder test ')
+    lm = LM(os.path.join(CONFORMER_PATH, "lm-ngram.bin"))
+    trie = load_trie(lm, os.path.join(CONFORMER_PATH, "lexicon.txt"))
+    decoder = Decoder(tokens, beamsize=100, lm=lm, trie=trie)
+    # decoder.synthetic_test('a ')
+    # decoder.synthetic_test('hello ')
+    # decoder.synthetic_test('hello world ')
+    # decoder.synthetic_test('this is a decoder test ')
 
     print("---------- REAL DATA ----------")
     for n in "a hello hello_world this_is_a_decoder_test".split():
