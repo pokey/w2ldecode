@@ -214,8 +214,7 @@ class LMGraphNode:
         # where it shouldn't be?
         yield Transition('|', 0, lm_state, self, stack)
         # Ask trie to find appropriate children, pushing self on stack.
-        for t in decoder.trie.children(decoder, lm_state, (self, stack)):
-            yield t
+        yield from decoder.trie.children(decoder, lm_state, (self, stack))
 
 class Decoder:
     tokens:    str
