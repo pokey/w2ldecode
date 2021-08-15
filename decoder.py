@@ -9,14 +9,21 @@ import os
 CONFORMER_PATH = os.path.expanduser("~/.talon/w2l/en_US-conformer")
 
 # ---------- TODOs ----------
-# 2. use ints for tokens instead of strs
+# 1. Make beam deduplication not quadratic by implementing hashing of beams.
+# 
+# 2. Use ints for tokens instead of strs.
 #
-# 3. fix the scoring. refer to the c++ code.
-#    should make a comment explaining the scoring once I grok it.
+# 3. Fix the scoring. Refer to the c++ code.
+#    I think it is mostly fixed at this point?
 # 3a. mixing scores from model/emissions needs a weighting factor
 # 3b. various places need hyperparameters mixed in (finishing a word, silence)
+#
+# 4. Allow no-LM operation (where we only use 1-gram word probabilities).
+#
+# 5. Actually use the command grammar/DFA to guide decode!
 
 
+# ---------- Some old notes about types in the C++ ----------
 # prevLmState is DFALM::State from w2l_decode_backend.cpp -- AM I SURE?
 # because DFALM::State::maxWordScore always returns 0, which seems very wrong.
 # what is getPrevSil()?
@@ -34,7 +41,7 @@ CONFORMER_PATH = os.path.expanduser("~/.talon/w2l/en_US-conformer")
 
 
 # ---------- HOW SCORING WORKS ----------
-# We generate new beams from these sources:
+# The C++ decoder generates new beams from these sources:
 #
 # 1. For each child of prevLmState (which is a DFA node):
 #
